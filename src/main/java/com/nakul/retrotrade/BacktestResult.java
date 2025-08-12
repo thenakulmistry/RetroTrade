@@ -20,7 +20,7 @@ public class BacktestResult {
 
     public void printReport(){
         System.out.println("\n---Backtest Result---");
-        System.out.printf("Total Return: %.2f%n",totalReturn);
+        System.out.printf("Total Return Percentage: %.2f%n",totalReturn);
         System.out.printf("Sharpe Ratio: %.2f%n",sharpeRatio);
         System.out.printf("Max Drawdown: %.2f%n",maxDrawdown);
         System.out.printf("Win Rate: %.2f%n",winRate);

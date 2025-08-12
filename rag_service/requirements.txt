@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+langchain
+langchain-community
+langchain-chroma
+langchain-ollama
+langchain-google-genai
+chromadb
+polygon-api-client
+python-dotenv

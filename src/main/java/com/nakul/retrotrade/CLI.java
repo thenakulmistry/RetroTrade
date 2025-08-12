@@ -53,24 +53,31 @@ public class CLI implements Runnable {
             return;
         }
 
-        BacktestResult bestResult = null;
-        double maxReturn = 0;
-        int shortWindow = 0, longWindow = 0;
+//        BacktestResult bestResult = null;
+//        double maxReturn = 0;
+//        int shortWindow = 0, longWindow = 0;
+//        BacktestEngine engine = new BacktestEngine();
+//        for(int i = 5; i <= 50; i++) {
+//            for(int j = i+1; j <= 200; j++) {
+//                TradingStrategy tradingStrategy = new MovingAverageStrategy(i, j);
+//                BacktestResult result = engine.run(candles, tradingStrategy);
+//                if(result.totalReturn > maxReturn) {
+//                    maxReturn = result.totalReturn;
+//                    bestResult = result;
+//                    shortWindow = i;
+//                    longWindow = j;
+//                }
+////                result.printReport();
+//            }
+//        }
+//        System.out.println("The best moving average strategy is with shortWindow of " +shortWindow+ " and longWindow of " +longWindow);
+//        bestResult.printReport();
+
+        System.out.println("Running backtest engine with RAG Signal Strategy");
+        TradingStrategy ragStrategy = new RAGSignalStrategy(this.symbol);
         BacktestEngine engine = new BacktestEngine();
-        for(int i = 5; i <= 50; i++) {
-            for(int j = i+1; j <= 200; j++) {
-                TradingStrategy tradingStrategy = new MovingAverageStrategy(i, j);
-                BacktestResult result = engine.run(candles, tradingStrategy);
-                if(result.totalReturn > maxReturn) {
-                    maxReturn = result.totalReturn;
-                    bestResult = result;
-                    shortWindow = i;
-                    longWindow = j;
-                }
-//                result.printReport();
-            }
-        }
-        System.out.println("The best moving average strategy is with shortWindow of " +shortWindow+ " and longWindow of " +longWindow);
-        bestResult.printReport();
+        BacktestResult result = engine.run(candles, ragStrategy, 10000);
+        System.out.println("\nBacktest report: ");
+        result.printReport();
     }
 }

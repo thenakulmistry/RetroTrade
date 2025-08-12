@@ -39,4 +39,14 @@ build/
 
 .env
 
+# Python / RAG Service specific
+rag_service/venv/
+rag_service/__pycache__/
+rag_service/chroma_db/
+rag_service/chroma_db_full/
+rag_service/AAPL_news_full.json
+rag_service/AAPL_news.json
+*.pyc
+
 /src/test/
+*.csv
