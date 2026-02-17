@@ -1,12 +1,15 @@
 import os
 import json
 import time
+import shutil
+import re
 from dotenv import load_dotenv
 from polygon import RESTClient
-from langchain_community.document_loaders import JSONLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_ollama import OllamaEmbeddings
+from langchain_chroma import Chroma
 
 # --- 1. Configuration and Setup ---
 # Load environment variables from .env file
@@ -18,6 +21,60 @@ START_DATE = "2019-01-02"
 END_DATE = "2025-07-31"
 NEWS_FILE_PATH = f"./{STOCK_SYMBOL}_news_full.json"
 CHROMA_DB_PATH = "./chroma_db_full" # Path to store the vector database
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "google").strip().lower()
+EMBEDDING_MODEL = os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
+OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+INGEST_TICKER_MODE = os.getenv("INGEST_TICKER_MODE", "primary").strip().lower()  # primary | all
+ENABLE_TEXT_SPLIT = os.getenv("ENABLE_TEXT_SPLIT", "false").strip().lower() == "true"
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+
+if EMBEDDING_PROVIDER == "ollama":
+    EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "256"))
+    EMBED_BATCH_PAUSE_SEC = float(os.getenv("EMBED_BATCH_PAUSE_SEC", "0"))
+    EMBED_MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES", "3"))
+else:
+    EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
+    EMBED_BATCH_PAUSE_SEC = float(os.getenv("EMBED_BATCH_PAUSE_SEC", "0.75"))
+    EMBED_MAX_RETRIES = int(os.getenv("EMBED_MAX_RETRIES", "8"))
+
+
+def get_embeddings():
+    if EMBEDDING_PROVIDER == "ollama":
+        return OllamaEmbeddings(model=OLLAMA_EMBEDDING_MODEL), f"ollama:{OLLAMA_EMBEDDING_MODEL}"
+
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    if not google_api_key:
+        raise ValueError("GOOGLE_API_KEY not found in .env file while EMBEDDING_PROVIDER=google")
+    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL), f"google:{EMBEDDING_MODEL}"
+
+
+def _extract_retry_seconds(error_text: str, default_seconds: float = 45.0) -> float:
+    match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", error_text, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return default_seconds
+
+
+def _add_batch_with_retry(vectorstore: Chroma, batch_docs, batch_index: int):
+    retries = 0
+    while True:
+        try:
+            vectorstore.add_documents(batch_docs)
+            return
+        except Exception as e:
+            message = str(e)
+            is_quota_error = "RESOURCE_EXHAUSTED" in message or "429" in message
+            if not is_quota_error or retries >= EMBED_MAX_RETRIES:
+                raise
+
+            wait_seconds = _extract_retry_seconds(message)
+            wait_seconds = max(wait_seconds, 5.0) + 2.0
+            retries += 1
+            print(
+                f"Batch {batch_index}: quota limit hit. Retry {retries}/{EMBED_MAX_RETRIES} in {wait_seconds:.1f}s..."
+            )
+            time.sleep(wait_seconds)
 
 # --- 2. Fetch News Data (Run only if the file doesn't exist) ---
 def fetch_and_save_news():
@@ -70,14 +127,42 @@ def ingest_data():
     """Loads, processes, and ingests news data into the vector database."""
     print("Starting data ingestion process...")
 
-    # Load the raw JSON data
-    # The 'jq_schema' helps extract the relevant text content from each article.
-    loader = JSONLoader(
-        file_path=NEWS_FILE_PATH,
-        jq_schema='.[].description', # Extracts the 'description' field from each article object
-        text_content=False
-    )
-    documents = loader.load()
+    if not os.path.exists(NEWS_FILE_PATH):
+        print(f"News file '{NEWS_FILE_PATH}' not found. Run fetch first.")
+        return
+
+    with open(NEWS_FILE_PATH, "r", encoding="utf-8") as f:
+        raw_articles = json.load(f)
+
+    documents = []
+    for article in raw_articles:
+        description = article.get("description") or ""
+        title = article.get("title") or ""
+        if not description.strip():
+            continue
+
+        published_utc = article.get("published_utc")
+        published_date = published_utc[:10] if isinstance(published_utc, str) and len(published_utc) >= 10 else None
+        content = f"Title: {title}\nDescription: {description}" if title else description
+        tickers = article.get("tickers") or []
+        symbols = [t.upper() for t in tickers if isinstance(t, str) and t.strip()] or [STOCK_SYMBOL]
+        symbols = list(dict.fromkeys(symbols))
+
+        target_symbols = [STOCK_SYMBOL] if INGEST_TICKER_MODE != "all" else symbols
+
+        for symbol in target_symbols:
+            metadata = {
+                "symbol": symbol,
+                "tickers": symbols,
+                "published_utc": published_utc,
+                "published_date": published_date,
+                "news_id": article.get("id"),
+                "article_url": article.get("article_url"),
+                "publisher": (article.get("publisher") or {}).get("name"),
+                "title": title,
+            }
+            documents.append(Document(page_content=content, metadata=metadata))
+
     print(f"Loaded {len(documents)} documents from JSON.")
 
     # Filter out any documents that might have empty descriptions
@@ -86,24 +171,47 @@ def ingest_data():
         print("No valid content found in the news file to ingest.")
         return
 
-    # Split documents into smaller chunks
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    docs = text_splitter.split_documents(documents)
-    print(f"Split documents into {len(docs)} chunks.")
+    if ENABLE_TEXT_SPLIT:
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        docs = text_splitter.split_documents(documents)
+        print(f"Split documents into {len(docs)} chunks.")
+    else:
+        docs = documents
+        print(f"Text splitting disabled. Using {len(docs)} documents as chunks.")
 
-    # Initialize the embedding model from Google
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    print("Initialized Google embedding model.")
+    embeddings, embedding_desc = get_embeddings()
+    print(f"Initialized embedding provider/model: {embedding_desc}")
 
     # Create and persist the ChromaDB vector store
     # This will create a 'chroma_db' directory if it doesn't exist.
     print("Creating and persisting vector store... This may take a few minutes.")
-    Chroma.from_documents(
-        documents=docs, 
-        embedding=embeddings, 
-        persist_directory=CHROMA_DB_PATH
+    if os.path.exists(CHROMA_DB_PATH):
+        shutil.rmtree(CHROMA_DB_PATH)
+        print(f"Cleared existing vector store at '{CHROMA_DB_PATH}' to avoid duplicate/stale records.")
+
+    vectorstore = Chroma(
+        persist_directory=CHROMA_DB_PATH,
+        embedding_function=embeddings
     )
-    print("Data ingestion complete. Vector store created at './chroma_db'.")
+
+    total_docs = len(docs)
+    print(
+        f"Starting batched ingestion: {total_docs} chunks, batch_size={EMBED_BATCH_SIZE}, pause={EMBED_BATCH_PAUSE_SEC}s"
+    )
+
+    batch_count = (total_docs + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
+    for batch_index, start in enumerate(range(0, total_docs, EMBED_BATCH_SIZE), start=1):
+        end = min(start + EMBED_BATCH_SIZE, total_docs)
+        batch_docs = docs[start:end]
+        _add_batch_with_retry(vectorstore, batch_docs, batch_index)
+
+        if batch_index % 10 == 0 or batch_index == batch_count:
+            print(f"Ingestion progress: batch {batch_index}/{batch_count} ({end}/{total_docs} chunks)")
+
+        if batch_index < batch_count and EMBED_BATCH_PAUSE_SEC > 0:
+            time.sleep(EMBED_BATCH_PAUSE_SEC)
+
+    print(f"Data ingestion complete. Vector store created at '{CHROMA_DB_PATH}'.")
 
 # --- Main Execution ---
 if __name__ == "__main__":

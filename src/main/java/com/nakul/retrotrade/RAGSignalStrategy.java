@@ -24,14 +24,14 @@ public class RAGSignalStrategy implements TradingStrategy{
     private final Map<String, Signal> signalCache = new HashMap<>();
 
     public RAGSignalStrategy(String symbol) {
-        this.symbol = symbol;
+        this.symbol = symbol.toUpperCase();
     }
 
     @Override
     public Signal generateSignal(int index, List<Candle> history, boolean isInPosition){
         String dateStr = history.get(index).getDate().format(DateTimeFormatter.ISO_LOCAL_DATE);
         String cacheKey = dateStr + ": " + isInPosition;
-        if(signalCache.containsKey(cacheKey)) return signalCache.get(dateStr);
+        if(signalCache.containsKey(cacheKey)) return signalCache.get(cacheKey);
 
         try{
             String jsonPayload = String.format("{\"symbol\": \"%s\", \"date\": \"%s\", \"is_in_position\": %b}", this.symbol, dateStr, isInPosition);
@@ -60,7 +60,7 @@ public class RAGSignalStrategy implements TradingStrategy{
         } catch(Exception e){
             System.err.println("Error calling RAG service for date " + dateStr + ": " + e.getMessage());
         }
-        signalCache.put(dateStr, Signal.HOLD);
+        signalCache.put(cacheKey, Signal.HOLD);
         return Signal.HOLD;
     }
 }

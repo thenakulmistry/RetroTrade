@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -8,10 +9,10 @@ from pydantic import BaseModel
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 # from langchain_community.vectorstores import Chroma
 from langchain_ollama import ChatOllama
+from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma 
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema.runnable import RunnablePassthrough
-from langchain.schema.output_parser import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 # --- Add Logging Configuration ---
 logging.basicConfig(level=logging.INFO)
@@ -20,21 +21,34 @@ logger = logging.getLogger(__name__)
 # --- 1. Load Configuration and Initialize Models ---
 load_dotenv()
 
-# Check for API Key
-if not os.getenv("GOOGLE_API_KEY"):
-    raise ValueError("GOOGLE_API_KEY not found in .env file")
-
 # Define constants
 CHROMA_DB_PATH = "./chroma_db_full"
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "google").strip().lower()
+EMBEDDING_MODEL = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/embedding-001")
+OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+
+
+def get_embeddings():
+    if EMBEDDING_PROVIDER == "ollama":
+        logger.info("Using Ollama embeddings model: %s", OLLAMA_EMBEDDING_MODEL)
+        return OllamaEmbeddings(model=OLLAMA_EMBEDDING_MODEL)
+
+    if EMBEDDING_PROVIDER != "google":
+        raise ValueError("EMBEDDING_PROVIDER must be either 'google' or 'ollama'")
+
+    if not os.getenv("GOOGLE_API_KEY"):
+        raise ValueError("GOOGLE_API_KEY not found in .env file while EMBEDDING_PROVIDER=google")
+
+    logger.info("Using Google embeddings model: %s", EMBEDDING_MODEL)
+    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
 
 # Initialize the LLM (Gemini Pro) and the embedding model
 # llm = ChatGoogleGenerativeAI(model="gemma-3n-e4b-it", temperature=0)
 llm = ChatOllama(model = "gemma3:1b")
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+embeddings = get_embeddings()
 
 # Connect to the existing ChromaDB vector store
 vectorstore = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embeddings)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 5}) # Retrieve top 5 most relevant news chunks
 
 # --- 2. Define the RAG Prompt and Chain ---
 # PROMPT 1: For when we are NOT in a position. Focus is on finding a strong entry signal.
@@ -82,6 +96,7 @@ Your response MUST be a single word: BUY or HOLD.
 CONTEXT:
 {context}
 QUESTION: What is the signal for {symbol} on {date}, given that we are currently NOT holding a position?
+IMPORTANT: Only the provided context should be used, and it contains news published on or before {cutoff_date}.
 ANSWER:
 """
 
@@ -98,6 +113,7 @@ Your response MUST be a single word: SELL or HOLD.
 CONTEXT:
 {context}
 QUESTION: What is the signal for {symbol} on {date}, given that we ARE currently holding a position?
+IMPORTANT: Only the provided context should be used, and it contains news published on or before {cutoff_date}.
 ANSWER:
 """
 
@@ -106,7 +122,69 @@ EXIT_PROMPT = ChatPromptTemplate.from_template(EXIT_TEMPLATE)
 
 # This function formats the retrieved documents into a single string.
 def format_docs(docs):
-    return "\n\n---\n\n".join([d.page_content for d in docs])
+    formatted = []
+    for doc in docs:
+        metadata = doc.metadata or {}
+        published_date = metadata.get("published_date", "unknown")
+        title = metadata.get("title", "")
+        prefix = f"[published_date={published_date}]"
+        if title:
+            prefix += f" [title={title}]"
+        formatted.append(f"{prefix}\n{doc.page_content}")
+    return "\n\n---\n\n".join(formatted)
+
+
+def _get_previous_day(date_str: str):
+    signal_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    return signal_date - timedelta(days=1)
+
+
+def _build_temporal_context(symbol: str, signal_date: str, max_docs: int = 5, fetch_k: int = 40):
+    cutoff_date = _get_previous_day(signal_date)
+    cutoff_iso = cutoff_date.isoformat()
+
+    raw_docs = vectorstore.similarity_search(
+        query=f"Financial news for {symbol} before {signal_date}",
+        k=fetch_k,
+        filter={"symbol": symbol}
+    )
+
+    eligible_docs = []
+    prev_day_docs = []
+    missing_date_count = 0
+
+    for doc in raw_docs:
+        metadata = doc.metadata or {}
+        published_date = metadata.get("published_date")
+        if not published_date:
+            missing_date_count += 1
+            continue
+        if published_date <= cutoff_iso:
+            eligible_docs.append(doc)
+            if published_date == cutoff_iso:
+                prev_day_docs.append(doc)
+
+    selected = list(prev_day_docs[:max_docs])
+    if len(selected) < max_docs:
+        selected_ids = {(d.metadata or {}).get("news_id") for d in selected}
+        for doc in eligible_docs:
+            doc_id = (doc.metadata or {}).get("news_id")
+            if doc_id in selected_ids:
+                continue
+            selected.append(doc)
+            if len(selected) >= max_docs:
+                break
+
+    stats = {
+        "cutoff_iso": cutoff_iso,
+        "retrieved": len(raw_docs),
+        "eligible": len(eligible_docs),
+        "prev_day": len(prev_day_docs),
+        "missing_date": missing_date_count,
+        "selected": len(selected),
+    }
+
+    return format_docs(selected), cutoff_iso, stats
 
 # --- 3. Create the FastAPI Application ---
 app = FastAPI(
@@ -135,27 +213,46 @@ def generate_signal(request: SignalRequest):
     """
     logger.info(f"Received request for {request.symbol} on {request.date}, in_position={request.is_in_position}")
     try:
+        symbol = request.symbol.upper().strip()
+        if not symbol:
+            raise HTTPException(status_code=400, detail="symbol must be a non-empty string")
+
+        try:
+            datetime.strptime(request.date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date must be in YYYY-MM-DD format")
 
         if request.is_in_position:
             prompt = EXIT_PROMPT
         else:
             prompt = ENTRY_PROMPT
-        
-        # Define the chain dynamically with the chosen prompt
-        rag_chain = (
-            {
-                "context": (lambda x: f"Financial news for {x['symbol']} on {x['date']}") | retriever | format_docs,
-                "symbol": (lambda x: x["symbol"]),
-                "date": (lambda x: x["date"])
-            }
-            | prompt
-            | llm
-            | StrOutputParser()
+
+        context, cutoff_date, retrieval_stats = _build_temporal_context(symbol, request.date)
+        logger.info(
+            "Temporal retrieval stats: symbol=%s date=%s cutoff=%s retrieved=%d eligible=%d prev_day=%d missing_date=%d selected=%d",
+            symbol,
+            request.date,
+            retrieval_stats["cutoff_iso"],
+            retrieval_stats["retrieved"],
+            retrieval_stats["eligible"],
+            retrieval_stats["prev_day"],
+            retrieval_stats["missing_date"],
+            retrieval_stats["selected"],
         )
 
+        if not context.strip():
+            logger.warning("No eligible historical context found for symbol=%s date=%s. Returning HOLD.", symbol, request.date)
+            return SignalResponse(symbol=symbol, date=request.date, signal="HOLD")
+
+        rag_chain = prompt | llm | StrOutputParser()
+
         logger.info("Invoking RAG chain...")
-        # Invoke the RAG chain to get the signal
-        raw_signal = rag_chain.invoke({"symbol": request.symbol, "date": request.date})
+        raw_signal = rag_chain.invoke({
+            "context": context,
+            "symbol": symbol,
+            "date": request.date,
+            "cutoff_date": cutoff_date,
+        })
         logger.info(f"RAG chain returned raw signal: '{raw_signal}'")
         
         # Clean up the signal to ensure it's one of the three expected values
@@ -166,10 +263,12 @@ def generate_signal(request: SignalRequest):
 
         logger.info(f"Returning cleaned signal: {cleaned_signal}")
         return SignalResponse(
-            symbol=request.symbol,
+            symbol=symbol,
             date=request.date,
             signal=cleaned_signal
         )
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         logger.error(f"An unhandled exception occurred: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error processing the request.")
