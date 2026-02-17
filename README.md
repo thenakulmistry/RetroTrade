@@ -29,7 +29,7 @@ Win Rate: 54.47
 ```
 
 <details>
-<summary><strong>Click to view full trade log (257 trades)</strong></summary>
+<summary><strong>Click to view full trade log (593 trades)</strong></summary>
 
 ```
 ---Trade log---
